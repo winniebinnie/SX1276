@@ -16,6 +16,9 @@ class SX1276:
         self.FHSS_list    = FHSS_list
         self.debug        = debug
         self.is_available = False  # let the main code know Tx and RxCont is done
+        self.pending_src_id = None
+        self.pending_pkt_id = None
+        self.latest_rx_pkt_type = None
         ########################
         #                      #
         #  1. Reset the modem  #
@@ -318,12 +321,15 @@ class SX1276:
             pkt_id      = urandom.randint(1,65535)
             self.pkt_id = pkt_id
         header = struct.pack(self.header_fmt, self.src_id, dst_id, pkt_id, pkt_type)
-        data = header + msg.encode() 
+        if isinstance(msg, str):
+            payload = header + msg.encode()
+        else:
+            payload = header + msg
 
         if pkt_type == self.PKT_TYPE['REQ']: 
             for _ in range(retry):
                 self.mode = 'STANDBY'
-                self.write_fifo(data)
+                self.write_fifo(payload)
                 self.mode = 'TX'               # Request Standby mode so SX1276 send out payload
                 for _ in range(timeout):
                     if self.pkt_id == 0:
@@ -337,7 +343,7 @@ class SX1276:
                 if debug: print('[Debug] Resend the REQ packet {} times but it is still not ACKed'.format(retry)) # No break means no response in 5 seconds
         elif pkt_type in [self.PKT_TYPE['ACK'], self.PKT_TYPE['BRD']]: 
             self.mode = 'STANDBY'
-            self.write_fifo(data)
+            self.write_fifo(payload)
             self.mode = 'TX'                            
         else:
             print("Unsupported Packet Type") 
@@ -382,36 +388,29 @@ class SX1276:
                 header, data = packet[:self.header_size], packet[self.header_size:] # extract header
                 src_id, dst_id, pkt_id, pkt_type = struct.unpack(self.header_fmt, header) # parse header
                 if self.debug: print('[Debug] Rx',pkt_type)
+                self.latest_rx_pkt_type = pkt_type
                 if   pkt_type == self.PKT_TYPE['REQ']:     # REQ Received
-                    # Receiver will get a REQ packet from the sender and meet this condition
                     if dst_id == self.src_id:
-                        # 2nd CP
                         self.mode = 'STANDBY'
-                        self.send(dst_id=src_id, pkt_id=pkt_id, pkt_type=self.PKT_TYPE['ACK'], msg='') # This is an ack message
-                        #print("We received a REQ packet and its dst_id matches our src_id. We are going to acknowledge it.")
-                        self.req_packet_handler(None, data, SNR, RSSI)
+                        self.pending_src_id = src_id
+                        self.pending_pkt_id = pkt_id
+                        self.req_packet_handler(self, data, SNR, RSSI)
                         if self.debug: print("[RxDone] Right REQ receiver")
                     else:
-                        #self.req_packet_handler(None, data, SNR, RSSI)
-                        # Shifting from 'RXCONTINUOUS' to 'RXCONTINUOUS' is not needed but we need reset IRQ
                         self.mode = 'RXCONTINUOUS'
-                        if self.debug: print("[RxDone] Wrong REQ receiver") # We received a REQ packet but its dst_id does not match our src_id.
-                        # We are not going to acknowledge it but we still display its content.
+                        if self.debug: print("[RxDone] Wrong REQ receiver")
                 elif pkt_type == self.PKT_TYPE['ACK']:     # ACK Received
                     if pkt_id == self.pkt_id:
-                        # 4th CP: The right sender get an ACK packet from the receiver and meet this condition
-                        self.pkt_id = 0                    # clear pkt_id so waiting in send function ends
-                        self.mode = 'STANDBY'              # The sender has got the ACK packet so we shift way from RxCont mode.
-                        self.is_available = True           # Free the sender
-                        if self.debug: print("[RxDone] Right ACK receiver") # REQ is ACKed
+                        self.req_packet_handler(self, data, SNR, RSSI)
+                        self.pkt_id = 0
+                        self.mode = 'STANDBY'
+                        self.is_available = True
+                        if self.debug: print("[RxDone] Right ACK receiver")
                     else:
-                        #print("We are not the original sender although we have received an ACK response. Ignore it.")
                         self.mode = 'RXCONTINUOUS'
-                        if self.debug: print("[RxDone] Wrong ACK receiver") 
+                        if self.debug: print("[RxDone] Wrong ACK receiver")
                 elif pkt_type == self.PKT_TYPE['BRD']:
-                    # BRD Received by the receiver. Do nothing.
-                    self.brd_packet_handler(None, data, SNR, RSSI)
-                    #print("We received a BRD packet whose sender does not expect an acknowledgement.")
+                    self.brd_packet_handler(self, data, SNR, RSSI)
                     self.mode = 'RXCONTINUOUS'
                     if self.debug: print("[RxDone] BRD receiver")
                 else:
